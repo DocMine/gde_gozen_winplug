@@ -42,11 +42,22 @@ if "linux" in platform:
 elif "windows" in platform:
     env.Append(LINKFLAGS=["-static"], LIBS=LIBS_COMMON)
 
-    env.Append(LIBS=["vpx", "aom"])
+    if os.path.exists("ffmpeg/bin/lib/libvpx.a"):
+        env.Append(LIBS=["vpx"])
+    if os.path.exists("ffmpeg/bin/lib/libaom.a"):
+        env.Append(LIBS=["aom"])
     env.Append(
         CPPPATH=["ffmpeg/bin/include"],
         LIBPATH=["ffmpeg/bin/lib", "ffmpeg/bin/lib64"],
-        LIBS=["ws2_32", "bcrypt", "secur32", "shlwapi", "mfuuid", "strmiids"],
+        LIBS=[
+            "ws2_32",
+            "bcrypt",
+            "secur32",
+            "shlwapi",
+            "mfuuid",
+            "strmiids",
+            "winpthread",
+        ],
     )
 elif "macos" in platform:
     # NOTE: MacOS can only be build on a MacOS machine!

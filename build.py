@@ -24,6 +24,16 @@ import urllib.request
 import tarfile
 
 
+def _first_existing_command(commands: list[str]) -> str | None:
+    for cmd in commands:
+        if shutil.which(cmd) is not None:
+            return cmd
+    return None
+
+
+PKG_CONFIG_BIN: str = _first_existing_command(["pkg-config", "pkgconf"]) or "pkg-config"
+
+
 THREADS: int = os.cpu_count() or 4
 PATH_BUILD_WINDOWS: str = "build_on_windows.py"
 
@@ -125,6 +135,116 @@ def _print_options(title: str, options: list[str]) -> int:
         return 1
 
 
+def _cmd_exists(cmd: str) -> bool:
+    return shutil.which(cmd) is not None
+
+
+def _linux_has_apt() -> bool:
+    return _cmd_exists("apt-get") or _cmd_exists("apt")
+
+
+def _install_with_apt(packages: list[str]) -> None:
+    subprocess.run(["sudo", "apt-get", "update"], check=True)
+    subprocess.run(["sudo", "apt-get", "install", "-y", *packages], check=True)
+
+
+def _ensure_unix_script(script_path: str) -> None:
+    if not os.path.isfile(script_path):
+        print(f"Error: required script not found: {script_path}")
+        sys.exit(1)
+
+    try:
+        original = open(script_path, "rb").read()
+    except OSError:
+        return
+
+    normalized = original.replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+    if normalized != original:
+        try:
+            open(script_path, "wb").write(normalized)
+        except OSError:
+            pass
+
+    try:
+        st = os.stat(script_path)
+        os.chmod(script_path, st.st_mode | 0o111)
+    except OSError:
+        pass
+
+
+def ensure_linux_build_dependencies(target_platform: str, arch: str) -> None:
+    if os_platform.system() != "Linux":
+        return
+
+    required_all = [
+        "git",
+        "cmake",
+        "make",
+        "gcc",
+        "g++",
+        "python3",
+        "scons",
+        "yasm",
+        "nasm",
+        "perl",
+    ]
+    required_any = [["pkg-config", "pkgconf"]]
+
+    if target_platform == OS_WINDOWS:
+        required_all.append("x86_64-w64-mingw32-gcc")
+        if arch == ARCH_X86_32:
+            required_all.append("i686-w64-mingw32-gcc")
+
+    missing: list[str] = [c for c in required_all if not _cmd_exists(c)]
+    for group in required_any:
+        if _first_existing_command(group) is None:
+            missing.append(" / ".join(group))
+
+    if not missing:
+        return
+
+    print("Missing build dependencies:")
+    for m in missing:
+        print(f"  - {m}")
+
+    if not _linux_has_apt():
+        print(
+            "No apt/apt-get detected. Install the missing dependencies manually and run build.py again."
+        )
+        sys.exit(1)
+
+    if _print_options("Install missing dependencies with apt-get?", ["yes", "no"]) != 1:
+        print("Please install the missing dependencies and run build.py again.")
+        sys.exit(1)
+
+    apt_packages = [
+        "git",
+        "cmake",
+        "build-essential",
+        "python3",
+        "python3-pip",
+        "scons",
+        "pkgconf",
+        "yasm",
+        "nasm",
+        "perl",
+    ]
+    if target_platform == OS_WINDOWS:
+        apt_packages += ["mingw-w64", "mingw-w64-tools"]
+
+    apt_packages = sorted(set(apt_packages))
+
+    try:
+        _install_with_apt(apt_packages)
+    except subprocess.CalledProcessError:
+        print("Error installing dependencies via apt-get.")
+        print("Please run:")
+        print(
+            f"  sudo apt-get update && sudo apt-get install -y {' '.join(apt_packages)}"
+        )
+        sys.exit(1)
+
+
 def get_ndk_host_tag() -> str:
     match os_platform.system().lower():
         case "linux":
@@ -139,90 +259,118 @@ def get_ndk_host_tag() -> str:
 
 
 def compile_libvpx(platform: str, arch: str) -> None:
+    if platform == OS_WINDOWS:
+        print("Skipping libvpx build for Windows target.")
+        return
+
     if not os.path.exists("./libvpx"):
         print("Error: libvpx directory not found! Please clone it into ./libvpx")
         print("Run: git clone https://chromium.googlesource.com/webm/libvpx")
         sys.exit(1)
 
-    print(f"Configuring libvpx for {platform} ({arch}) ...")
-    prefix = os.path.abspath("./ffmpeg/bin")
-    os.makedirs(prefix, exist_ok=True)
+    def run_libvpx_build(disable_runtime_cpu_detect: bool) -> None:
+        print(f"Configuring libvpx for {platform} ({arch}) ...")
+        prefix = os.path.abspath("./ffmpeg/bin")
+        os.makedirs(prefix, exist_ok=True)
 
-    env = os.environ.copy()
-    cmd = [
-        "./configure",
-        f"--prefix={prefix}",
-        "--disable-examples",
-        "--disable-unit-tests",
-        "--disable-tools",
-        "--disable-docs",
-        "--disable-shared",
-        "--enable-static",
-        "--enable-pic",
-    ]
+        env = os.environ.copy()
+        cmd = [
+            "./configure",
+            f"--prefix={prefix}",
+            "--disable-examples",
+            "--disable-unit-tests",
+            "--disable-tools",
+            "--disable-docs",
+            "--disable-shared",
+            "--enable-static",
+            "--enable-pic",
+        ]
 
-    target = ""
-    if platform == OS_LINUX:
-        if arch == ARCH_X86_64:
-            target = "x86_64-linux-gcc"
-        elif arch == ARCH_ARM64:
-            target = "arm64-linux-gcc"
-            env["CROSS"] = "aarch64-linux-gnu-"
-    elif platform == OS_WINDOWS:
-        target = "generic-gnu"
-        toolchain = "i686" if arch == ARCH_X86_32 else "x86_64"
-        env["CROSS"] = f"{toolchain}-w64-mingw32-"
-    elif platform == OS_MACOS:
-        target = "arm64-darwin20-gcc" if arch == ARCH_ARM64 else "x86_64-darwin20-gcc"
-    elif platform == OS_ANDROID:
-        target = "arm64-android-gcc" if arch == ARCH_ARM64 else "armv7-android-gcc"
-        ndk = os.getenv("ANDROID_NDK_ROOT") or os.getenv("ANDROID_NDK")
-        if ndk:
-            host_tag = get_ndk_host_tag()
-            toolchain_bin = f"{ndk}/toolchains/llvm/prebuilt/{host_tag}/bin"
-            target_arch = (
-                "aarch64-linux-android"
+        if disable_runtime_cpu_detect:
+            cmd.append("--disable-runtime-cpu-detect")
+
+        target = ""
+        if platform == OS_LINUX:
+            if arch == ARCH_X86_64:
+                target = "x86_64-linux-gcc"
+            elif arch == ARCH_ARM64:
+                target = "arm64-linux-gcc"
+                env["CROSS"] = "aarch64-linux-gnu-"
+        elif platform == OS_WINDOWS:
+            toolchain = "i686" if arch == ARCH_X86_32 else "x86_64"
+            env["CROSS"] = f"{toolchain}-w64-mingw32-"
+            target = "x86-win32-gcc" if arch == ARCH_X86_32 else "x86_64-win64-gcc"
+        elif platform == OS_MACOS:
+            target = (
+                "arm64-darwin20-gcc"
                 if arch == ARCH_ARM64
-                else "armv7a-linux-androideabi"
+                else "x86_64-darwin20-gcc"
             )
-            env["CC"] = f"{toolchain_bin}/{target_arch}{ANDROID_API_LEVEL}-clang"
-            env["CXX"] = f"{toolchain_bin}/{target_arch}{ANDROID_API_LEVEL}-clang++"
-            env["AS"] = env["CC"]
-            env["AR"] = f"{toolchain_bin}/llvm-ar"
-            env["NM"] = f"{toolchain_bin}/llvm-nm"
-            env["LD"] = env["CXX"]
-    elif platform == OS_WEB:
-        target = "generic-gnu"
-        cmd.insert(0, "emconfigure")
-        cmd.extend(["--disable-multithread", "--disable-webm-io"])
+        elif platform == OS_ANDROID:
+            target = "arm64-android-gcc" if arch == ARCH_ARM64 else "armv7-android-gcc"
+            ndk = os.getenv("ANDROID_NDK_ROOT") or os.getenv("ANDROID_NDK")
+            if ndk:
+                host_tag = get_ndk_host_tag()
+                toolchain_bin = f"{ndk}/toolchains/llvm/prebuilt/{host_tag}/bin"
+                target_arch = (
+                    "aarch64-linux-android"
+                    if arch == ARCH_ARM64
+                    else "armv7a-linux-androideabi"
+                )
+                env["CC"] = f"{toolchain_bin}/{target_arch}{ANDROID_API_LEVEL}-clang"
+                env["CXX"] = f"{toolchain_bin}/{target_arch}{ANDROID_API_LEVEL}-clang++"
+                env["AS"] = env["CC"]
+                env["AR"] = f"{toolchain_bin}/llvm-ar"
+                env["NM"] = f"{toolchain_bin}/llvm-nm"
+                env["LD"] = env["CXX"]
+        elif platform == OS_WEB:
+            target = "generic-gnu"
+            cmd.insert(0, "emconfigure")
+            cmd.extend(["--disable-multithread", "--disable-webm-io"])
 
-    if target:
-        cmd.append(f"--target={target}")
-    if os.path.exists("./libvpx/Makefile"):
-        subprocess.run(["make", "clean"], cwd="./libvpx/")
+        if target:
+            cmd.append(f"--target={target}")
 
-    print(f"Running libvpx configure: {' '.join(cmd)}")
-    if subprocess.run(cmd, cwd="./libvpx/", env=env).returncode != 0:
-        print("Error: libvpx configure failed!")
-        sys.exit(1)
+        if os.path.exists("./libvpx/Makefile"):
+            if subprocess.run(["make", "distclean"], cwd="./libvpx/").returncode != 0:
+                subprocess.run(["make", "clean"], cwd="./libvpx/")
 
-    print("Compiling libvpx ...")
-    make_cmd = (
-        ["emmake", "make", f"-j{THREADS}"]
-        if platform == OS_WEB
-        else ["make", f"-j{THREADS}"]
-    )
-    install_cmd = (
-        ["emmake", "make", "install"] if platform == OS_WEB else ["make", "install"]
-    )
+        print(f"Running libvpx configure: {' '.join(cmd)}")
+        if subprocess.run(cmd, cwd="./libvpx/", env=env).returncode != 0:
+            print("Error: libvpx configure failed!")
+            sys.exit(1)
 
-    if subprocess.run(make_cmd, cwd="./libvpx/", env=env).returncode != 0:
-        print("Error: libvpx compile failed!")
-        sys.exit(1)
+        print("Compiling libvpx ...")
+        make_cmd = (
+            ["emmake", "make", f"-j{THREADS}"]
+            if platform == OS_WEB
+            else ["make", f"-j{THREADS}"]
+        )
+        install_cmd = (
+            ["emmake", "make", "install"]
+            if platform == OS_WEB
+            else ["make", "install"]
+        )
 
-    if subprocess.run(install_cmd, cwd="./libvpx/", env=env).returncode != 0:
-        print("Error: libvpx install failed!")
-        sys.exit(1)
+        if subprocess.run(make_cmd, cwd="./libvpx/", env=env).returncode != 0:
+            raise RuntimeError("libvpx compile failed")
+
+        if subprocess.run(install_cmd, cwd="./libvpx/", env=env).returncode != 0:
+            print("Error: libvpx install failed!")
+            sys.exit(1)
+
+    try:
+        run_libvpx_build(disable_runtime_cpu_detect=False)
+    except RuntimeError:
+        if platform == OS_WINDOWS:
+            print(
+                "libvpx failed to compile; retrying with --disable-runtime-cpu-detect ..."
+            )
+            run_libvpx_build(disable_runtime_cpu_detect=True)
+        else:
+            print("Error: libvpx compile failed!")
+            sys.exit(1)
+
     print("libvpx compilation finished!")
 
 
@@ -387,6 +535,11 @@ def compile_ffmpeg(platform: str, arch: str) -> None:
         subprocess.run(["make", "distclean"], cwd="./ffmpeg/")
         subprocess.run(["rm", "-rf", "bin"], cwd="./ffmpeg/")
 
+    _ensure_unix_script("./ffmpeg/configure")
+    _ensure_unix_script("./ffmpeg/ffbuild/version.sh")
+    _ensure_unix_script("./ffmpeg/ffbuild/libversion.sh")
+    _ensure_unix_script("./ffmpeg/ffbuild/pkgconfig_generate.sh")
+
     if platform == OS_LINUX:
         compile_ffmpeg_linux(arch)
     elif platform == OS_WINDOWS:
@@ -436,6 +589,7 @@ def compile_ffmpeg_linux(arch: str) -> None:
 
     if subprocess.run(cmd, cwd="./ffmpeg/").returncode != 0:
         print("Error: FFmpeg failed!")
+        sys.exit(1)
 
     print("Compiling FFmpeg for Linux ...")
     if (
@@ -455,7 +609,7 @@ def compile_ffmpeg_linux(arch: str) -> None:
     for lib in libs_to_static:
         try:
             libdir = subprocess.check_output(
-                ["pkg-config", "--variable=libdir", lib], text=True
+                [PKG_CONFIG_BIN, "--variable=libdir", lib], text=True
             ).strip()
             if libdir:
                 lib_a = os.path.join(libdir, f"lib{lib}.a")
@@ -489,12 +643,11 @@ def compile_ffmpeg_windows(arch: str) -> None:
     os.environ["PKG_CONFIG_PATH"] = (
         f"{prefix_bin}/lib/pkgconfig:{prefix_bin}/lib64/pkgconfig:/usr/{toolchain}-w64-mingw32/lib/pkgconfig"
     )
-    compile_libvpx(OS_WINDOWS, arch)
     compile_libaom(OS_WINDOWS, arch)
 
     cmd = [
         "./configure",
-        "--pkg-config=pkg-config",
+        f"--pkg-config={PKG_CONFIG_BIN}",
         "--prefix=./bin",
         "--disable-shared",
         "--enable-static",
@@ -509,7 +662,6 @@ def compile_ffmpeg_windows(arch: str) -> None:
         "--extra-libs=-lpthread",
         "--extra-ldflags=-static",
         "--extra-cflags=-fPIC",
-        "--enable-libvpx",
         "--enable-schannel",
     ]
     cmd += ENABLED_MODULES
@@ -518,6 +670,7 @@ def compile_ffmpeg_windows(arch: str) -> None:
     result = subprocess.run(cmd, cwd="./ffmpeg/")
     if result.returncode != 0:
         print("Error: FFmpeg failed!")
+        sys.exit(1)
 
     print("Compiling FFmpeg for Windows ...")
     if subprocess.run(["make", f"-j{THREADS}"], cwd="./ffmpeg/").returncode != 0:
@@ -561,6 +714,7 @@ def compile_ffmpeg_macos(arch: str) -> None:
     result = subprocess.run(cmd, cwd="./ffmpeg/")
     if result.returncode != 0:
         print("Error: FFmpeg failed!")
+        sys.exit(1)
 
     print("Compiling FFmpeg for MacOS ...")
     if (
@@ -580,7 +734,7 @@ def compile_ffmpeg_macos(arch: str) -> None:
     for lib in libs_to_static:
         try:
             libdir = subprocess.check_output(
-                ["pkg-config", "--variable=libdir", lib], text=True
+                [PKG_CONFIG_BIN, "--variable=libdir", lib], text=True
             ).strip()
             if libdir:
                 lib_a = os.path.join(libdir, f"lib{lib}.a")
@@ -852,6 +1006,8 @@ def main():
         subprocess.run([sys.executable, PATH_BUILD_WINDOWS], cwd="./", check=True)
         sys.exit(3)
 
+    ensure_linux_build_dependencies(OS_LINUX, ARCH_X86_64)
+
     if os.path.exists("./ffmpeg/ffbuild/config.mak"):
         match _print_options("Init/Update submodules", ["no", "initialize", "update"]):
             case 2:
@@ -900,6 +1056,8 @@ def main():
         case _:  # Linux
             if _print_options(title_arch, [ARCH_X86_64, ARCH_ARM64]) == 2:
                 arch = ARCH_ARM64
+
+    ensure_linux_build_dependencies(platform, arch)
 
     target: str = TARGET_DEV
     if _print_options("Select target", [TARGET_DEV, TARGET_RELEASE]) == 2:
