@@ -268,6 +268,8 @@ def compile_libvpx(platform: str, arch: str) -> None:
         print("Run: git clone https://chromium.googlesource.com/webm/libvpx")
         sys.exit(1)
 
+    _ensure_unix_script("./libvpx/build/make/rtcd.pl")
+
     def run_libvpx_build(disable_runtime_cpu_detect: bool) -> None:
         print(f"Configuring libvpx for {platform} ({arch}) ...")
         prefix = os.path.abspath("./ffmpeg/bin")
@@ -334,6 +336,18 @@ def compile_libvpx(platform: str, arch: str) -> None:
         if os.path.exists("./libvpx/Makefile"):
             if subprocess.run(["make", "distclean"], cwd="./libvpx/").returncode != 0:
                 subprocess.run(["make", "clean"], cwd="./libvpx/")
+
+        for rtcd_header in [
+            "./libvpx/vpx_scale_rtcd.h",
+            "./libvpx/vpx_dsp_rtcd.h",
+            "./libvpx/vp8_rtcd.h",
+            "./libvpx/vp9_rtcd.h",
+        ]:
+            try:
+                if os.path.exists(rtcd_header):
+                    os.remove(rtcd_header)
+            except OSError:
+                pass
 
         print(f"Running libvpx configure: {' '.join(cmd)}")
         if subprocess.run(cmd, cwd="./libvpx/", env=env).returncode != 0:
